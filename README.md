@@ -4,9 +4,9 @@
 ## How to Use
 
 ```
-git clone https://github.com/Michael-Sebero/Arch-Package-Dictionary
+git clone https://github.com/Michael-Sebero/Package-Dictionary
 
-cd /home/$USER/Arch-Package-Dictionary/tools
+cd /home/$USER/Package-Dictionary/tools
 
 pd test
 ```
