@@ -1,6 +1,7 @@
 ## Compatibility
 * `Pacman` 
-* `Paru` or `Yay`
+* `Paru`
+* `Yay`
 * `XBPS`
 * `APT`
 * `Yum`
