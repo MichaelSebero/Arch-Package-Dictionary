@@ -1,5 +1,10 @@
-## Requirments
+## Compatibility
+. `Pacman` 
 . `Paru` or `Yay`
+. `XBPS`
+. `APT`
+. `Yum`
+. `Nix`
 
 ## How to Use
 
