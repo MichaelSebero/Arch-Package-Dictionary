@@ -1,10 +1,11 @@
 ## Compatibility
-. `Pacman` 
-. `Paru` or `Yay`
-. `XBPS`
-. `APT`
-. `Yum`
-. `Nix`
+* `Pacman` 
+* `Paru` or `Yay`
+* `XBPS`
+* `APT`
+* `Yum`
+* `Nix`
+* `Flatpak`
 
 ## How to Use
 
