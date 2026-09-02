@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::env;
 use std::io::{self, Write};
 use std::process::Stdio;
+use std::time::Duration;
 
 use crossterm::{
     cursor,
@@ -18,9 +19,12 @@ const GREEN: &str = "\x1B[32m";
 const YELLOW: &str = "\x1B[33m";
 const MAGENTA: &str = "\x1B[35m";
 const CYAN: &str = "\x1B[36m";
-const BRIGHT_BLUE: &str = "\x1B[94m";
 const RESET: &str = "\x1B[0m";
 const DIM: &str = "\x1B[2m";
+
+// Every source here just queries an already-built local cache or makes one
+// quick network call, so a single shared timeout is enough for all of them.
+const SEARCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug)]
 struct Package {
@@ -49,12 +53,11 @@ async fn main() {
     }
 
     let search_term = args[1..].join(" ");
-    maybe_bootstrap_nix().await;
     let results = search_all_sources(&search_term).await;
 
     if results.is_empty() {
         eprintln!("{}Error:{} no supported package manager found on this system.", RED, RESET);
-        eprintln!("Supported: pacman, paru/yay, xbps-query, apt-cache, dnf/yum, nix, flatpak.");
+        eprintln!("Supported: pacman, paru/yay, xbps-query, apt-cache, dnf/yum, flatpak.");
         std::process::exit(1);
     }
 
@@ -70,7 +73,6 @@ enum Source {
     Xbps,
     Apt,
     YumDnf(&'static str),
-    Nix,
     Flatpak,
 }
 
@@ -82,7 +84,6 @@ impl Source {
             Source::Xbps => "XBPS".to_string(),
             Source::Apt => "APT".to_string(),
             Source::YumDnf(bin) => bin.to_uppercase(),
-            Source::Nix => "Nix".to_string(),
             Source::Flatpak => "Flatpak".to_string(),
         }
     }
@@ -94,21 +95,7 @@ impl Source {
             Source::Xbps => YELLOW,
             Source::Apt => MAGENTA,
             Source::YumDnf(_) => CYAN,
-            Source::Nix => BRIGHT_BLUE,
             Source::Flatpak => GREEN,
-        }
-    }
-
-    // Everything else here just queries an already-built local cache or
-    // makes one quick network call. `nix search` is the outlier: the first
-    // run on a given nixpkgs revision has to evaluate (or fetch and
-    // evaluate) the package set to build its local search cache, which can
-    // easily take well past 10s. Later searches against the same revision
-    // are fast, since that cache is then warm.
-    fn timeout(&self) -> std::time::Duration {
-        match self {
-            Source::Nix => std::time::Duration::from_secs(60),
-            _ => std::time::Duration::from_secs(10),
         }
     }
 }
@@ -117,13 +104,12 @@ impl Source {
 // concurrently; the fixed ordering of the pushes below (not completion order)
 // determines the display order later, so output stays stable across runs.
 async fn detect_sources() -> Vec<Source> {
-    let (pacman, aur, xbps, apt, yum_dnf, nix, flatpak) = tokio::join!(
+    let (pacman, aur, xbps, apt, yum_dnf, flatpak) = tokio::join!(
         command_exists("pacman"),
         detect_aur_helper(),
         command_exists("xbps-query"),
         command_exists("apt-cache"),
         detect_yum_dnf(),
-        command_exists("nix"),
         command_exists("flatpak"),
     );
 
@@ -133,7 +119,6 @@ async fn detect_sources() -> Vec<Source> {
     if xbps { sources.push(Source::Xbps); }
     if apt { sources.push(Source::Apt); }
     if let Some(bin) = yum_dnf { sources.push(Source::YumDnf(bin)); }
-    if nix { sources.push(Source::Nix); }
     if flatpak { sources.push(Source::Flatpak); }
     sources
 }
@@ -156,167 +141,6 @@ async fn command_exists(cmd: &str) -> bool {
         .output().await.map(|o| o.status.success()).unwrap_or(false)
 }
 
-#[derive(Clone, Copy)]
-enum Escalation {
-    Sudo,
-    Doas,
-    Su,
-}
-
-impl Escalation {
-    fn program(&self) -> &'static str {
-        match self {
-            Escalation::Sudo => "sudo",
-            Escalation::Doas => "doas",
-            Escalation::Su => "su",
-        }
-    }
-
-    // sudo/doas exec the given argv directly, so a shell that understands
-    // `&&` has to be named explicitly. `su -c` already passes its argument
-    // through the target (root) shell on its own.
-    fn args_for<'a>(&self, shell_command: &'a str) -> Vec<&'a str> {
-        match self {
-            Escalation::Su => vec!["-c", shell_command],
-            Escalation::Sudo | Escalation::Doas => vec!["sh", "-c", shell_command],
-        }
-    }
-
-    // How this would read as a one-liner in the prompt shown to the user.
-    fn display(&self, shell_command: &str) -> String {
-        match self {
-            Escalation::Su => format!("su -c \"{}\"", shell_command),
-            Escalation::Sudo | Escalation::Doas => {
-                format!("{} sh -c \"{}\"", self.program(), shell_command)
-            }
-        }
-    }
-}
-
-async fn detect_privilege_escalation() -> Option<Escalation> {
-    if command_exists("sudo").await { Some(Escalation::Sudo) }
-    else if command_exists("doas").await { Some(Escalation::Doas) }
-    else if command_exists("su").await { Some(Escalation::Su) }
-    else { None }
-}
-
-// $USER isn't always set -- minimal shells, some non-login sessions, and
-// (as testing this turned up) some sandboxed/root environments all leave it
-// empty even though the user is perfectly well-defined. whoami asks the
-// kernel directly and is a much more reliable fallback.
-async fn resolve_username() -> Option<String> {
-    match std::env::var("USER") {
-        Ok(u) if !u.is_empty() => Some(u),
-        _ => resolve_username_via_whoami().await,
-    }
-}
-
-async fn resolve_username_via_whoami() -> Option<String> {
-    match run_and_capture("whoami", &[]).await {
-        Ok(out) if !out.trim().is_empty() => Some(out.trim().to_string()),
-        _ => None,
-    }
-}
-
-// Real usernames are always in this set; this is a safety net for the
-// (extremely unlikely) case of something odder, since the name gets
-// interpolated into a shell command string below.
-fn is_safe_username(user: &str) -> bool {
-    !user.is_empty() && user.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-}
-
-// Whether nix could actually create things directly under /nix right now.
-// Existence alone isn't enough to tell -- distro nix packages often ship
-// /nix as an empty, root-owned stub (expecting nix-daemon to sort out
-// permissions later), which "exists" but is just as unusable as it being
-// missing outright, and produces the exact same permission error either
-// way. Actually probing beats stat()-ing the mode/owner and reasoning about
-// it by hand, since it has to hold for whichever user is running this.
-fn can_write_to_nix_dir() -> bool {
-    let probe = std::path::Path::new("/nix/.pd-write-test");
-    match std::fs::File::create(probe) {
-        Ok(_) => {
-            let _ = std::fs::remove_file(probe);
-            true
-        }
-        Err(_) => false,
-    }
-}
-
-fn nix_dir_has_no_content() -> bool {
-    match std::fs::read_dir("/nix") {
-        Ok(mut entries) => entries.next().is_none(),
-        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
-    }
-}
-
-// If `nix` is on PATH but `/nix` isn't writable, every nix invocation fails
-// trying to touch the store -- this is what you get after e.g. `pacman -S
-// nix` without ever starting nix-daemon, which is normally what creates
-// and owns /nix (sometimes that leaves /nix missing entirely, sometimes it
-// leaves an empty root-owned stub -- either way nix can't use it). That's
-// one clear cause with one safe fix, so offer to run it once, up front,
-// rather than showing the same failure every time. Deliberately narrow:
-// this only fires when /nix is missing or empty. If it already has real
-// content in it, this doesn't guess -- taking ownership of a directory
-// something else populated on purpose is a meaningfully riskier move than
-// claiming an empty one, so that case is left alone and just shows
-// whatever nix itself reports.
-async fn maybe_bootstrap_nix() {
-    if !command_exists("nix").await {
-        return;
-    }
-    if can_write_to_nix_dir() {
-        return;
-    }
-    if !nix_dir_has_no_content() {
-        return;
-    }
-    let Some(user) = resolve_username().await else {
-        return; // can't tell who to chown it to -- don't guess
-    };
-    if !is_safe_username(&user) {
-        return;
-    }
-
-    eprintln!(
-        "{}Nix{} is on PATH, but {}/nix{} isn't writable by you, so nix search will fail.",
-        BOLD, RESET, BOLD, RESET
-    );
-
-    let command = format!("mkdir -p /nix && chown {}: /nix", user);
-
-    let Some(escalation) = detect_privilege_escalation().await else {
-        eprintln!("I couldn't find sudo, doas, or su to fix this automatically. As root:");
-        eprintln!("  {}", command);
-        return;
-    };
-
-    eprintln!("This can be fixed once with:");
-    eprintln!("  {}", escalation.display(&command));
-    eprint!("Run this now? [y/N] ");
-
-    let mut answer = String::new();
-    if io::stdin().read_line(&mut answer).is_err() {
-        return;
-    }
-    if !answer.trim().eq_ignore_ascii_case("y") {
-        return;
-    }
-
-    // Inherits our stdin/stdout, so a password prompt from sudo/doas/su
-    // shows up on the real terminal and can actually be answered.
-    let status = TokioCommand::new(escalation.program())
-        .args(escalation.args_for(&command))
-        .status().await;
-
-    match status.map(|s| s.success()) {
-        Ok(true) => {}
-        Ok(false) => eprintln!("{}Warning:{} that didn't succeed; nix may still fail below.", RED, RESET),
-        Err(e) => eprintln!("{}Warning:{} couldn't run {}: {}", RED, RESET, escalation.program(), e),
-    }
-}
-
 // ─── Search ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
@@ -332,9 +156,8 @@ async fn search_all_sources(term: &str) -> Vec<(Source, SearchOutcome)> {
 
     let handles: Vec<_> = sources.into_iter().map(|source| {
         let term = term_owned.clone();
-        let timeout = source.timeout();
         tokio::spawn(async move {
-            let result = tokio::time::timeout(timeout, run_search(source, &term)).await;
+            let result = tokio::time::timeout(SEARCH_TIMEOUT, run_search(source, &term)).await;
             let outcome = handle_search_result(result, &source.display_name());
             (source, outcome)
         })
@@ -357,7 +180,6 @@ async fn run_search(source: Source, term: &str) -> std::io::Result<Vec<Package>>
         Source::Xbps => search_xbps(term).await,
         Source::Apt => search_apt(term).await,
         Source::YumDnf(bin) => search_yum_dnf(bin, term).await,
-        Source::Nix => search_nix(term).await,
         Source::Flatpak => search_flatpak(term).await,
     }
 }
@@ -400,12 +222,12 @@ fn is_better_package(new: &Package, existing: &Package) -> bool {
 }
 
 // Runs `program` and returns its stdout as UTF-8. Deliberately does NOT
-// treat a non-zero exit as failure -- pacman (and, from what I recall, nix)
-// both exit non-zero for a perfectly normal "nothing matched", so doing
-// that would misreport a chunk of clean, empty results as errors. What IS a
-// reliable signal, since a genuine "no matches" is normally silent on both
-// streams, is stdout coming back empty while stderr has something in it --
-// that combination means the tool actually had something to say.
+// treat a non-zero exit as failure -- pacman exits non-zero for a perfectly
+// normal "nothing matched", so doing that would misreport a chunk of clean,
+// empty results as errors. What IS a reliable signal, since a genuine "no
+// matches" is normally silent on both streams, is stdout coming back empty
+// while stderr has something in it -- that combination means the tool
+// actually had something to say.
 async fn run_and_capture(program: &str, args: &[&str]) -> std::io::Result<String> {
     let output = TokioCommand::new(program).args(args).output().await?;
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -459,8 +281,7 @@ async fn search_xbps(term: &str) -> std::io::Result<Vec<Package>> {
 }
 
 // xbps-query -Rs prints one line per package: "[state] pkgver  description",
-// e.g. "[-] zsh-5.9_6   A shell with lots of features". Worth a quick sanity
-// check against a live Void box -- this is from memory, not a test system.
+// e.g. "[-] zsh-5.9_6   A shell with lots of features".
 fn parse_xbps_output(stdout: &str) -> Vec<Package> {
     stdout.lines().filter_map(|line| {
         let after_state = line.split_once(']')?.1.trim_start();
@@ -542,42 +363,6 @@ fn strip_arch_suffix(name: &str) -> &str {
     name
 }
 
-async fn search_nix(term: &str) -> std::io::Result<Vec<Package>> {
-    let stdout = run_and_capture(
-        "nix",
-        &["--extra-experimental-features", "nix-command flakes", "search", "nixpkgs", term],
-    ).await?;
-    Ok(parse_nix_output(&stdout))
-}
-
-// `nix search nixpkgs <term>` prints "* attr.path (version)" then an indented
-// description line. Not every package has a description, so we peek before
-// consuming the next line rather than assuming it's always there.
-fn parse_nix_output(stdout: &str) -> Vec<Package> {
-    let mut results = Vec::new();
-    let mut lines = stdout.lines().peekable();
-    while let Some(line) = lines.next() {
-        let Some(header) = line.strip_prefix("* ") else { continue };
-        let (attr_path, version) = match header.rsplit_once(" (") {
-            Some((path, ver)) => (path.trim(), ver.trim_end_matches(')').to_string()),
-            None => (header.trim(), "unknown".to_string()),
-        };
-        let name = nix_pkg_name(attr_path);
-        let description = match lines.peek() {
-            Some(next) if !next.trim_start().starts_with("* ") && !next.trim().is_empty() => {
-                lines.next().unwrap().trim().to_string()
-            }
-            _ => "No description.".to_string(),
-        };
-        results.push(Package::new(name, version, description));
-    }
-    results
-}
-
-fn nix_pkg_name(attr_path: &str) -> String {
-    attr_path.rsplit('.').next().unwrap_or(attr_path).trim_matches('"').to_string()
-}
-
 async fn search_flatpak(term: &str) -> std::io::Result<Vec<Package>> {
     let stdout = run_and_capture(
         "flatpak",
@@ -624,7 +409,7 @@ fn print_results(results: &[(Source, SearchOutcome)]) {
         .map(|(source, outcome)| {
             let status = match outcome {
                 SearchOutcome::Found(pkgs) => format_count(pkgs.len()),
-                SearchOutcome::TimedOut => format!("timed out after {}s", source.timeout().as_secs()),
+                SearchOutcome::TimedOut => format!("timed out after {}s", SEARCH_TIMEOUT.as_secs()),
                 SearchOutcome::Failed(_) => "failed".to_string(),
             };
             format!("{}{}:{} {}", BOLD, source.display_name(), RESET, status)
@@ -638,7 +423,7 @@ fn print_results(results: &[(Source, SearchOutcome)]) {
             SearchOutcome::Found(pkgs) => add_section(&mut output, &source.display_name(), pkgs, source.color()),
             SearchOutcome::TimedOut => output.push_str(&format!(
                 "{}{}{}{} — timed out after {}s\n\n",
-                BOLD, source.color(), source.display_name(), RESET, source.timeout().as_secs()
+                BOLD, source.color(), source.display_name(), RESET, SEARCH_TIMEOUT.as_secs()
             )),
             SearchOutcome::Failed(msg) => output.push_str(&format!(
                 "{}{}{}{} — search failed: {}\n\n",
@@ -825,26 +610,6 @@ mod tests {
     }
 
     #[test]
-    fn nix_parses_header_and_optional_description() {
-        let out = concat!(
-            "* legacyPackages.x86_64-linux.hello (2.12.1)\n",
-            "  A program that produces a familiar, friendly greeting\n",
-            "* legacyPackages.x86_64-linux.undescribed (1.0)\n",
-            "* legacyPackages.x86_64-linux.next (3.0)\n",
-            "  Another package\n",
-        );
-        let pkgs = parse_nix_output(out);
-        assert_eq!(pkgs.len(), 3);
-        assert_eq!(pkgs[0].name, "hello");
-        assert_eq!(pkgs[0].version, "2.12.1");
-        assert!(pkgs[0].has_description());
-        assert_eq!(pkgs[1].name, "undescribed");
-        assert_eq!(pkgs[1].description, "No description.");
-        assert_eq!(pkgs[2].name, "next");
-        assert_eq!(pkgs[2].description, "Another package");
-    }
-
-    #[test]
     fn split_pkgver_handles_hyphenated_names() {
         assert_eq!(split_pkgver("xtools-6.3_1"), ("xtools".to_string(), "6.3_1".to_string()));
         assert_eq!(split_pkgver("gtk-doc-1.33.2_1"), ("gtk-doc".to_string(), "1.33.2_1".to_string()));
@@ -852,10 +617,10 @@ mod tests {
     }
 
     // run_and_capture's whole job is telling a real error apart from a
-    // clean empty result without relying on exit status (which pacman and
-    // nix both use non-zero for on a normal "no matches"). These use `sh`
-    // to simulate each stream/exit combination directly rather than
-    // depending on any package manager being present in the test env.
+    // clean empty result without relying on exit status (pacman exits
+    // non-zero for a normal "no matches"). These use `sh` to simulate each
+    // stream/exit combination directly rather than depending on any
+    // package manager being present in the test env.
 
     #[tokio::test]
     async fn run_and_capture_returns_stdout_on_clean_success() {
@@ -865,7 +630,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_and_capture_treats_silent_nonzero_exit_as_empty_not_failure() {
-        // Mirrors pacman/nix exiting 1 with nothing on either stream for a
+        // Mirrors pacman exiting 1 with nothing on either stream for a
         // normal "nothing matched" -- must NOT be reported as an error.
         let out = run_and_capture("sh", &["-c", "exit 1"]).await.unwrap();
         assert!(out.trim().is_empty());
@@ -886,45 +651,5 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.trim(), "real-result");
-    }
-
-    #[tokio::test]
-    async fn resolve_username_via_whoami_returns_a_name() {
-        // Regression test: this is the fallback maybe_bootstrap_nix needs
-        // when $USER is unset, which turned out to be true in the sandbox
-        // this was developed in despite it being a perfectly normal (root)
-        // session -- relying on $USER alone silently broke the whole
-        // feature. Deliberately doesn't touch $USER itself, since env vars
-        // are process-global and cargo test runs tests in parallel.
-        let user = resolve_username_via_whoami().await;
-        assert!(user.as_deref().is_some_and(|u| !u.is_empty()));
-    }
-
-    #[test]
-    fn is_safe_username_accepts_normal_names_rejects_shell_syntax() {
-        assert!(is_safe_username("george"));
-        assert!(is_safe_username("user_01"));
-        assert!(is_safe_username("first-last"));
-        assert!(!is_safe_username(""));
-        assert!(!is_safe_username("george; rm -rf /"));
-        assert!(!is_safe_username("$(whoami)"));
-        assert!(!is_safe_username("has space"));
-    }
-
-    #[test]
-    fn escalation_wraps_command_in_a_shell_for_sudo_and_doas_but_not_su() {
-        let cmd = "mkdir -p /nix && chown george: /nix";
-        assert_eq!(Escalation::Sudo.args_for(cmd), vec!["sh", "-c", cmd]);
-        assert_eq!(Escalation::Doas.args_for(cmd), vec!["sh", "-c", cmd]);
-        // su's own -c already passes the command through the root shell,
-        // so it doesn't need (or want) an extra `sh -c` wrapper.
-        assert_eq!(Escalation::Su.args_for(cmd), vec!["-c", cmd]);
-    }
-
-    #[test]
-    fn escalation_display_matches_what_actually_runs() {
-        let cmd = "mkdir -p /nix && chown george: /nix";
-        assert_eq!(Escalation::Sudo.display(cmd), "sudo sh -c \"mkdir -p /nix && chown george: /nix\"");
-        assert_eq!(Escalation::Su.display(cmd), "su -c \"mkdir -p /nix && chown george: /nix\"");
     }
 }
