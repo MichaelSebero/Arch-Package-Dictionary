@@ -5,7 +5,6 @@
 * `XBPS`
 * `APT`
 * `Yum`
-* `Nix`
 * `Flatpak`
 
 ## How to Use
