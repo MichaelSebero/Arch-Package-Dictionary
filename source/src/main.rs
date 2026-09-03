@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use crossterm::{
     cursor,
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, MouseEventKind},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, MouseButton, MouseEventKind},
     execute,
     terminal::{self, DisableLineWrap, EnableLineWrap, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -474,9 +474,21 @@ fn run_viewer(lines: &[&str]) -> std::io::Result<()> {
     result
 }
 
+// Flips mouse capture on or off and tells the terminal about it. Shared by
+// the 'm' key and the middle-click handler below so both stay in sync.
+fn toggle_mouse_mode(stdout: &mut impl Write, mouse_enabled: &mut bool) -> std::io::Result<()> {
+    *mouse_enabled = !*mouse_enabled;
+    if *mouse_enabled {
+        execute!(stdout, EnableMouseCapture)
+    } else {
+        execute!(stdout, DisableMouseCapture)
+    }
+}
+
 fn viewer_loop(stdout: &mut impl Write, lines: &[&str]) -> std::io::Result<()> {
     let mut offset: usize = 0;
     let mut dragging = false;
+    let mut mouse_enabled = true;
 
     loop {
         let (cols, rows) = terminal::size()?;
@@ -514,8 +526,9 @@ fn viewer_loop(stdout: &mut impl Write, lines: &[&str]) -> std::io::Result<()> {
 
         execute!(stdout, cursor::MoveTo(0, rows - 1))?;
         write!(stdout,
-            "\x1B[0m\x1B[7m  {}/{} lines  │  ↑↓ / PgUp PgDn / scroll  │  q to quit  \x1B[0m",
-            (offset + 1).min(total), total
+            "\x1B[0m\x1B[7m  {}/{} lines  │  ↑↓ PgUp PgDn  │  {}  │  q to quit  \x1B[0m",
+            (offset + 1).min(total), total,
+            if mouse_enabled { "scroll mode (middle-click or m to select text)" } else { "select mode (m to resume scroll)" }
         )?;
 
         stdout.flush()?;
@@ -530,12 +543,21 @@ fn viewer_loop(stdout: &mut impl Write, lines: &[&str]) -> std::io::Result<()> {
                     KeyCode::PageDown | KeyCode::Char('f') => { offset = (offset + view_h).min(max_offset); }
                     KeyCode::Home | KeyCode::Char('g') => { offset = 0; }
                     KeyCode::End  | KeyCode::Char('G') => { offset = max_offset; }
+                    KeyCode::Char('m') => { toggle_mouse_mode(stdout, &mut mouse_enabled)?; }
                     _ => { dragging = false; continue; }
                 },
                 Event::Mouse(m) => match m.kind {
                     MouseEventKind::ScrollUp   => { offset = offset.saturating_sub(3); }
                     MouseEventKind::ScrollDown => { offset = (offset + 3).min(max_offset); }
                     MouseEventKind::Up(_) => { dragging = false; continue; }
+                    // One-way door: this only ever fires while capture is on, since
+                    // DisableMouseCapture tells the terminal to stop forwarding mouse
+                    // events to us at all. So a middle-click can drop us into select
+                    // mode, but it can never bring us back -- there's no event left to
+                    // catch. 'm' is the only way back to scroll mode.
+                    MouseEventKind::Down(MouseButton::Middle) => {
+                        toggle_mouse_mode(stdout, &mut mouse_enabled)?;
+                    }
                     MouseEventKind::Down(_) if m.column == scroll_col => {
                         dragging = true;
                         let row = (m.row as usize).min(view_h.saturating_sub(1));
